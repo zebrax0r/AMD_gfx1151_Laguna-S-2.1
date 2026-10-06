@@ -137,9 +137,13 @@ cmd_add_user() {
   load_secrets
   local name="${1:-}"; shift || true
   [[ -n "$name" ]] || die "Usage: ./gateway.sh add-user <name> [--tpm N] [--rpm N] [--budget USD] [--parallel N]"
-  # max_parallel_requests=1 by default: with PARALLEL=2 slots, one user
-  # can't occupy both and lock everyone else out.
-  local tpm="null" rpm="null" budget="null" parallel=1
+  # max_parallel_requests=3 by default. Was 1, but real clients send
+  # several requests at once — confirmed 2026-10-06: a user's IDE client
+  # fired a background request alongside the main one and got 429 "Rate
+  # limit exceeded ... max_parallel_requests" with the server idle. Extra
+  # requests beyond the 2 llama-server slots just queue there. Trade-off:
+  # one busy user can hold both slots; lower with set-limits if that bites.
+  local tpm="null" rpm="null" budget="null" parallel=3
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --tpm) tpm="$2"; shift 2 ;;
@@ -172,6 +176,31 @@ qwen-code users, from a clone of this repo:
 EOF
 }
 
+cmd_set_limits() {
+  # set-limits <name> [--parallel N] [--tpm N] [--rpm N] [--budget USD]
+  # Use "none" to clear a limit, e.g. --tpm none.
+  load_secrets
+  local name="${1:-}"; shift || true
+  [[ -n "$name" && $# -gt 0 ]] || die "Usage: ./gateway.sh set-limits <name> [--parallel N] [--tpm N] [--rpm N] [--budget USD]  (use 'none' to clear)"
+  local token
+  token="$(psql_q -At -c "SELECT token FROM \"LiteLLM_VerificationToken\" WHERE key_alias = '${name//\'/}'")"
+  [[ -n "$token" ]] || die "No gateway user '$name'."
+  local updates='{}' field val
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --parallel) field=max_parallel_requests ;;
+      --tpm) field=tpm_limit ;;
+      --rpm) field=rpm_limit ;;
+      --budget) field=max_budget ;;
+      *) die "Unknown option: $1" ;;
+    esac
+    val="$2"; [[ "$val" == none ]] && val=null
+    updates="$(jq --arg f "$field" --argjson v "$val" '.[$f] = $v' <<<"$updates")"
+    shift 2
+  done
+  api POST /key/update "$(jq --arg k "$token" '. + {key: $k}' <<<"$updates")" | jq -c '{key_alias, max_parallel_requests, tpm_limit, rpm_limit, max_budget}'
+}
+
 cmd_list_users() {
   load_secrets
   psql_q -c "SELECT key_alias AS name, key_name AS key_hint, max_parallel_requests AS par, tpm_limit, rpm_limit,
@@ -199,7 +228,7 @@ cmd_usage() {
                     sum(s.total_tokens) AS total_tokens, max(s.\"startTime\" AT TIME ZONE 'UTC')::timestamptz(0) AS last_used
              FROM \"LiteLLM_SpendLogs\" s
              LEFT JOIN \"LiteLLM_VerificationToken\" v ON v.token = s.api_key
-             WHERE s.\"startTime\" > now() - interval '${days} days'
+             WHERE s.\"startTime\" > (now() AT TIME ZONE 'UTC') - interval '${days} days'
              GROUP BY 1 ORDER BY total_tokens DESC NULLS LAST;"
 }
 
@@ -264,8 +293,10 @@ Usage: ./gateway.sh <command>
   init                     Install LiteLLM, generate .secrets/gateway.env
   serve | stop | status    Run/stop/check the gateway (port 4000)
   add-user <name> [--tpm N] [--rpm N] [--budget USD] [--parallel N]
-                           Create a user key (printed once). Default: 1 request at a time
+                           Create a user key (printed once). Default: 3 requests at a time
   list-users               Keys, limits and spend
+  set-limits <name> [--parallel N] [--tpm N] [--rpm N] [--budget USD]
+                           Change a user's limits in place ('none' clears one)
   revoke-user <name>       Delete a user's key immediately
   usage [days]             Per-user token totals (default: last 30 days)
   install-services [env]   Start llama-server + gateway at boot (default env: laguna.env)
@@ -281,6 +312,7 @@ case "${1:-}" in
   status) cmd_status ;;
   add-user) shift; cmd_add_user "$@" ;;
   list-users) cmd_list_users ;;
+  set-limits) shift; cmd_set_limits "$@" ;;
   revoke-user) shift; cmd_revoke_user "$@" ;;
   usage) shift; cmd_usage "$@" ;;
   install-services) shift; cmd_install_services "$@" ;;

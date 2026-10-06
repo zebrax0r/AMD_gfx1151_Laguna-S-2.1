@@ -397,7 +397,10 @@ or budgets later — without anyone sharing the single llama-server key.
   `127.0.0.1` (`HOST` in `laguna.env`), so nothing reaches it except the
   gateway. Plain HTTP: keys cross the network unencrypted, which is
   acceptable inside the VPN but put TLS (e.g. Caddy) in front before
-  exposing it anywhere less trusted.
+  exposing it anywhere less trusted. In practice the Cisco VPN only lets
+  port 22 through to this box (tested 2026-10-06: 4000 and every other
+  port tried was dropped upstream), so remote users connect over an SSH
+  tunnel instead — see [Connecting over the VPN](#connecting-over-the-vpn-ssh-tunnel).
 - **Model name:** users always ask for `local-coder`. llama-server serves
   one model at a time and ignores the requested name, so switching
   Laguna ⇄ Flash-Next changes nothing for users.
@@ -405,9 +408,12 @@ or budgets later — without anyone sharing the single llama-server key.
   262,144 tokens each. Measured ~20 tok/s per user with both generating
   (~26 alone), ~37 tok/s total; a 20-round 2-at-a-time soak produced no
   wrong or garbled output (see `laguna-env.example`). Each key defaults to
-  one request at a time, so one person can't take both slots. A third
-  simultaneous request queues until a slot frees up — and a long prefill
-  can hold a slot for many minutes.
+  3 requests at a time — IDE clients send background requests alongside
+  the main one, and a limit of 1 made them fail with 429 `max_parallel_requests`
+  while the server sat idle. Requests beyond the 2 slots queue in
+  llama-server rather than failing; a long prefill can hold a slot for
+  many minutes. One busy user can occupy both slots — tighten per user with
+  `./gateway.sh set-limits <name> --parallel 1` if that becomes a problem.
 - **Privacy:** LiteLLM logs token counts per request, not prompts or
   responses (`store_prompts_in_spend_logs: false`, verified).
 - **Secrets:** `.secrets/gateway.env` (gitignored, mode 600) holds the
@@ -419,6 +425,7 @@ or budgets later — without anyone sharing the single llama-server key.
 ```bash
 ./gateway.sh init                      # LiteLLM venv + Prisma client + secrets
 sudo ./gateway/setup-root.sh           # Postgres, ufw rules, systemd linger
+sudo ./gateway/setup-tunnel-root.sh    # tunnel-only SSH account for VPN users
 ./serve-laguna.sh serve                # llama-server (now loopback-only, 2 slots)
 ./gateway.sh serve                     # LiteLLM on :4000
 ./gateway.sh install-services          # start both at boot (systemd --user)
@@ -434,10 +441,18 @@ networks differ.
 ./gateway.sh add-user alice                    # prints base URL + key + model, once
 ./gateway.sh add-user bob --tpm 100000 --rpm 30 --budget 5
 ./gateway.sh list-users                        # names, limits, key hints
+./gateway.sh set-limits bob --parallel 2 --tpm none   # change limits in place
 ./gateway.sh usage 7                           # tokens per user, last 7 days
 ./gateway.sh revoke-user alice                 # immediate 401 for that key
 ./gateway.sh status
+
+sudo ./gateway/tunnel-key.sh add alice 'ssh-ed25519 AAAA...'   # let alice tunnel in
+sudo ./gateway/tunnel-key.sh list
+sudo ./gateway/tunnel-key.sh remove alice
 ```
+
+Use the same name for a person in both places. Fully revoking someone is
+`tunnel-key.sh remove <name>` plus `gateway.sh revoke-user <name>`.
 
 Budgets: costs are set to 0 in `gateway/litellm-config.yaml`, so
 `--budget` does nothing until you give tokens a nominal price there (e.g.
@@ -469,6 +484,39 @@ capped at a few hundred tokens can get an empty answer with
 
 You (on the server box) should use a key from `add-user` too, rather than
 the direct llama-server key, so your own usage shows up in `usage`.
+
+### Connecting over the VPN (SSH tunnel)
+
+Port 4000 isn't reachable through the Cisco VPN, so VPN users forward a
+local port over SSH. `setup-tunnel-root.sh` creates one shared account,
+`llm-tunnel`, that can do nothing except forward to `127.0.0.1:4000`: no
+password, shell, TTY, or any other forwarding. Each user is one line in
+`/etc/ssh/llm-tunnel/authorized_keys`, managed with `tunnel-key.sh`. Their
+LiteLLM key still controls and meters what they can do once connected.
+
+To onboard someone:
+
+1. They send their SSH **public** key (`~/.ssh/id_ed25519.pub`; make one
+   with `ssh-keygen -t ed25519` if needed).
+2. On the server: `./gateway.sh add-user <name>` and
+   `sudo ./gateway/tunnel-key.sh add <name> '<their public key>'`.
+3. On their machine, open the tunnel and leave it running (it prints
+   nothing while it's working):
+
+   ```bash
+   ssh -N -L 4000:127.0.0.1:4000 llm-tunnel@10.49.56.223
+   ```
+
+4. Point the client at the tunnel's local end, **not** the server IP:
+   base URL `http://127.0.0.1:4000/v1`. For `qwen-code`:
+
+   ```bash
+   SERVER_HOST=127.0.0.1 CLIENT_PORT=4000 CLIENT_API_KEY=sk-... \
+     CLIENT_MODEL_NAME=local-coder ./serve-laguna.sh wire-qwen-code
+   ```
+
+Removing a tunnel key doesn't drop tunnels that are already open; `sudo
+pkill -u llm-tunnel sshd` cuts them all (every tunnel user's session).
 
 ## Client-only setup (a laptop or other machine that doesn't run the server)
 
