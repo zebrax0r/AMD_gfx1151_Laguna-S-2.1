@@ -97,8 +97,16 @@ configurations.
 
 You haven't applied the GRUB kernel parameter from README "System prep §2"
 yet (or haven't rebooted since). Without it, GPU memory allocation is
-capped well below the nominal 96GB budget, and large-context serving may
-fail unexpectedly.
+capped at roughly half of RAM, and large-context serving may fail
+unexpectedly.
+
+## `probe` warns about a large BIOS VRAM carve-out
+
+The BIOS "UMA Frame Buffer Size" is reserving RAM that Linux can't see
+and llama.cpp mostly doesn't use (it allocates from GTT). On this box a
+32GB carve-out made a 128GB machine look like a 96GB one. Set it to
+512MB in BIOS (README "System prep §2a"), then make sure the GTT limit
+(§2b) is raised to match the extra RAM.
 
 ## `[API Error: 400 request (N tokens) exceeds the available context size (CTX_SIZE tokens)]`
 

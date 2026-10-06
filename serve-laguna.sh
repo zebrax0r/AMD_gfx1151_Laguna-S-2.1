@@ -6,7 +6,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-ENV_FILE="laguna.env"
+# ENV_FILE can be overridden to serve a different model with the same
+# script, e.g. `ENV_FILE=flashnext.env ./serve-laguna.sh serve` — see
+# docs/ALTERNATIVE_MODELS.md. Only one model fits in memory at a time, and
+# PID/log files are shared, so `stop` one before `serve`-ing the other.
+ENV_FILE="${ENV_FILE:-laguna.env}"
 ENV_EXAMPLE="laguna-env.example"
 
 # ---------------------------------------------------------------- helpers --
@@ -68,7 +72,7 @@ load_env() {
   # `build`/`serve`) so `wire-qwen-code` and the `serve` banner print the
   # right address for that machine to use.
   SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
-  CTX_SIZE="${CTX_SIZE:-163840}"
+  CTX_SIZE="${CTX_SIZE:-262144}"
   # CLIENT_CTX_SIZE is what we tell the qwen-code CLI harness via
   # generationConfig.contextWindowSize — deliberately LOWER than CTX_SIZE.
   # qwen-code's own token counts are estimates (its debug log literally logs
@@ -77,7 +81,7 @@ load_env() {
   # by hand: reporting the exact CTX_SIZE (65536, an earlier value) still
   # overshot to 68046 and hard-failed. The gap between CLIENT_CTX_SIZE and
   # CTX_SIZE is the safety margin that absorbs that slop.
-  CLIENT_CTX_SIZE="${CLIENT_CTX_SIZE:-122880}"
+  CLIENT_CTX_SIZE="${CLIENT_CTX_SIZE:-196608}"
   # These three cap how much a SINGLE turn can grow the conversation, which
   # matters more than CLIENT_CTX_SIZE's margin does: confirmed by hand that
   # a single turn (many fanned-out tool calls) can add tens of thousands of
@@ -106,7 +110,7 @@ load_env() {
   # together — see laguna-env.example for current values.
   QWEN_TOOL_OUTPUT_THRESHOLD="${QWEN_TOOL_OUTPUT_THRESHOLD:-8000}"
   QWEN_TOOL_OUTPUT_LINES="${QWEN_TOOL_OUTPUT_LINES:-300}"
-  QWEN_SESSION_TOKEN_LIMIT="${QWEN_SESSION_TOKEN_LIMIT:-143360}"
+  QWEN_SESSION_TOKEN_LIMIT="${QWEN_SESSION_TOKEN_LIMIT:-229376}"
   # Caps a single turn's generated tokens. Without this, qwen-code defaults
   # to the model's *declared* output limit — effectively unbounded here.
   # Confirmed by hand: a real turn generated 12,000+ tokens at a healthy,
@@ -143,6 +147,9 @@ load_env() {
   # gets fixed upstream).
   SPEC_TYPE="${SPEC_TYPE:-}"
   SPEC_DRAFT_N_MAX="${SPEC_DRAFT_N_MAX:-4}"
+  # Separate draft/MTP head file, relative to MODEL_DIR — e.g. Qwen3.8-
+  # Flash-Next's MTP head (flashnext.env). Empty = none.
+  SPEC_DRAFT_MODEL="${SPEC_DRAFT_MODEL:-}"
   SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-laguna-s-2.1}"
 
   BUILD_DIR="$LLAMA_CPP_DIR/build"
@@ -216,8 +223,22 @@ cmd_probe() {
   if grep -q 'amdgpu.gttsize=' /proc/cmdline 2>/dev/null; then
     log "amdgpu.gttsize is set: $(grep -o 'amdgpu\.gttsize=[0-9]*' /proc/cmdline)"
   else
-    warn "amdgpu.gttsize not set in /proc/cmdline. Large-context serving may be capped well below the 96GB nominal budget. See README §2c."
+    warn "amdgpu.gttsize not set in /proc/cmdline. Large-context serving may be capped well below what this box's RAM allows. See README System prep §2."
   fi
+  # A BIOS "UMA Frame Buffer Size" carve-out is taken out of physical RAM
+  # before Linux ever sees it — confirmed by hand: this 128GB box shipped
+  # with a 32GB carve-out, so the OS saw only ~92GiB and the whole repo
+  # was tuned as if it were a 96GB machine. llama.cpp allocates from GTT,
+  # so the carve-out was mostly dead weight. 512MB is the minimum.
+  local drm_dev vram_mib gtt_mib
+  for drm_dev in /sys/class/drm/card*/device; do
+    [[ -r "$drm_dev/mem_info_vram_total" ]] || continue
+    vram_mib=$(( $(cat "$drm_dev/mem_info_vram_total") / 1048576 ))
+    gtt_mib=$(( $(cat "$drm_dev/mem_info_gtt_total") / 1048576 ))
+    log "BIOS VRAM carve-out: ${vram_mib}MiB, GTT limit: ${gtt_mib}MiB"
+    [[ "$vram_mib" -le 1024 ]] || warn "BIOS VRAM carve-out is ${vram_mib}MiB — that RAM is hidden from Linux and mostly unused by llama.cpp (which allocates from GTT). Set 'UMA Frame Buffer Size' to 512MB in BIOS, then raise GTT. See README System prep §2."
+    break
+  done
 
   echo "== Disk / RAM =="
   df -h "$SCRIPT_DIR" | tail -n1
@@ -317,6 +338,16 @@ _hf_bin() {
     return
   fi
   local venv_dir=".venv-hf"
+  # venv entry points have an ABSOLUTE shebang baked in at creation time —
+  # confirmed by hand: after this repo's directory rename, .venv-hf/bin/hf
+  # still pointed at the old path and failed with "No such file or
+  # directory" despite existing and being executable. Same class of bug as
+  # the llama.cpp RUNPATH note in load_env. Rebuild the venv if it can't
+  # actually run, rather than just checking it exists.
+  if [[ -d "$venv_dir" ]] && ! "$venv_dir/bin/hf" version >/dev/null 2>&1; then
+    log "Existing $venv_dir is broken (stale shebang after a repo move?) — rebuilding it." >&2
+    rm -rf "$venv_dir"
+  fi
   if [[ ! -x "$venv_dir/bin/hf" ]]; then
     need_bin python3
     log "Bootstrapping a local venv for the 'hf' CLI ($venv_dir, gitignored)..." >&2
@@ -438,6 +469,7 @@ _build_server_args() {
   fi
   if [[ -n "$SPEC_TYPE" ]] && _detect_flag --spec-type >/dev/null; then
     SERVER_ARGS+=(--spec-type "$SPEC_TYPE" --spec-draft-n-max "$SPEC_DRAFT_N_MAX")
+    if [[ -n "$SPEC_DRAFT_MODEL" ]]; then SERVER_ARGS+=(--spec-draft-model "$MODEL_DIR/$SPEC_DRAFT_MODEL"); fi
   fi
 }
 
@@ -472,7 +504,7 @@ cmd_serve() {
   mkdir -p "$LOG_DIR"
 
   [[ "$PARALLEL" -le 1 ]] || warn "PARALLEL=$PARALLEL (>1). This raises exposure to lemonade-sdk#3160 (progressive corruption under concurrent load). Consider 'install-watchdog'."
-  [[ "$CTX_SIZE" -le 163840 ]] || warn "CTX_SIZE=$CTX_SIZE (>163840). Verified safe at 163840 on this exact build/quant as of 2026-09-19 (~79GB/80GB GTT used at load, ~2.8GB free). 196608 loads but leaves only ~1.4GB free; 262144 hard OOMs during KV-cache allocation. Treat anything above 163840 as unverified and likely memory-tight, even though native context is 1,048,576 — retest with amd-smi + a needle-in-haystack check before trusting a higher value."
+  [[ "$CTX_SIZE" -le 262144 ]] || warn "CTX_SIZE=$CTX_SIZE (>262144). Verified correct at 262144 on this exact build/quant as of 2026-10-06 (128GB box, 116GiB GTT): 81.9GiB GTT used at load, exact needle retrieval at 247K tokens. 524288 loads with ~21GiB GTT free and 786432 with ~8GiB, but neither has had a correctness test, and system RAM gets tight above 512K; 1048576 OOMs during KV-cache allocation. Prefill at 247K already took ~50 min and generation at that depth ran ~4 tok/s, so a bigger window is rarely useful in practice."
 
   _build_server_args "$MODEL_FILE"
 

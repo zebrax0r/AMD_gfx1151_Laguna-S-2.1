@@ -16,7 +16,10 @@ mechanism avoids entirely — see "Known bugs" below for what's actually
 been hit on this exact box.
 
 Target hardware: an AMD Strix Halo APU (GPU arch **gfx1151**, e.g. Ryzen AI
-Max/Max+ 300 series), **96GB unified memory**, no dedicated VRAM.
+Max/Max+ 300 series), **128GB unified memory** (HP Z2 Mini G1a), no
+dedicated VRAM. Until 2026-10-06 this repo was tuned as if the box had
+96GB — a 32GB BIOS VRAM carve-out was hiding a quarter of the RAM from
+Linux. See "System prep §2".
 
 This is the sibling of [AMD_MI210_Bunya_LLM_tools_Qwen3.8-27B](https://github.com/zebrax0r/AMD_MI210_Bunya_LLM_tools_Qwen3.8-27B),
 rebuilt from scratch for a single-APU workstation instead of a SLURM/MI210
@@ -103,19 +106,31 @@ silently-wrong-logits behavior (llama.cpp#28211): a 4088-token prompt
 (well past 2048) correctly retrieved an exact marker string in a
 needle-in-haystack test, no corruption.
 
-**`CTX_SIZE=163840` — found empirically, not assumed.** Directly tested
-on this box 2026-09-19: 262144 (2x an earlier 131072 baseline) hard OOMs
-during KV-cache allocation; 196608 loads but leaves only ~1.4GB of GTT
-free (too tight by this repo's own standard); 163840 loads with a
-comfortable ~2.8GB free and was verified correct with a real ~130K-token
-needle-in-haystack prompt (exact marker retrieval, `finish_reason: stop`,
-14m18s end-to-end at this hardware's prefill speed for a prompt that
-long). Laguna's advertised native context (1,048,576) is real capability
-the *model* has — it is not evidence this *hardware's GPU memory* can
-serve anywhere near that much of it; 163840 is the actual tested ceiling
-here, a little over 15% of the advertised figure. `CLIENT_CTX_SIZE`
-(122,880) and `QWEN_SESSION_TOKEN_LIMIT` (143,360) are scaled from this
-new ceiling using the same ratios as before.
+**`CTX_SIZE=262144` — found empirically, not assumed.** Retested
+2026-10-06 after the BIOS carve-out fix raised the GTT limit from 80GiB
+to 116GiB (see "System prep §2"). GTT used at load, UD-Q4_K_M, ubatch
+2048:
+
+| `CTX_SIZE` | GTT used | GTT free | Result |
+|---|---|---|---|
+| 163840 | 77.0GiB | 39.0GiB | loads (the old default) |
+| 262144 | 81.9GiB | 34.1GiB | **loads; exact needle retrieval at 247K tokens** |
+| 524288 | 94.9GiB | 21.1GiB | loads; not correctness-tested |
+| 786432 | 107.9GiB | 8.1GiB | loads, but system RAM nearly exhausted |
+| 1048576 | — | — | OOM allocating the KV cache |
+
+The 262144 needle test: a 247,003-token prompt with one marker line 60%
+of the way in, retrieved exactly (`finish_reason: stop`). It also shows
+the practical limit is time, not memory: prefill took 49m40s (83 tok/s
+average, falling steadily as the context fills) and generation at that
+depth ran at ~3.9 tok/s, against ~26 tok/s on a short context. A coding
+session that grows to that size gradually is fine; pasting 250K tokens
+in one go is not. That's why the default stops at 262144 even though
+512K fits: a bigger window costs memory headroom and buys context you'd
+rarely want to wait for. (Before the fix, 262144 OOMed and 163840 was
+the ceiling, verified with a ~130K-token needle in 14m18s.)
+`CLIENT_CTX_SIZE` (196,608) and `QWEN_SESSION_TOKEN_LIMIT` (229,376)
+keep the same 75% / 87.5% ratios to `CTX_SIZE` as before.
 
 ### If you're using `qwen-code`
 
@@ -161,6 +176,15 @@ any OpenAI-compatible endpoint) is worth trying as a side-by-side
 alternative against this same server — no server-side changes needed,
 just point it at `http://<SERVER_HOST>:8000/v1`. Not yet set up in this
 repo; noted here as a live follow-up, not a recommendation to switch yet.
+
+## Other models
+
+Qwen3.8-Flash-Next was tested on this box on 2026-10-06 (fits at
+UD-IQ4_XS; 32–38 tok/s with its MTP draft head; exact needle retrieval at
+241K tokens) but needs a newer llama.cpp than production uses. Halogen
+(a closed-source engine for the same model) was looked at but not run.
+Details, commands and a side-by-side with Laguna:
+[docs/ALTERNATIVE_MODELS.md](docs/ALTERNATIVE_MODELS.md).
 
 ## Quickstart
 
@@ -223,24 +247,41 @@ only, as was already done here.
 
 ### 2. GTT / kernel memory tuning
 
-**Applied on this box 2026-09-19.** Strix Halo has no fixed VRAM
-partition — the GPU claims system RAM dynamically via GTT. Without
-tuning, you'll be capped well below the nominal 96GB budget (the
-driver's unconfigured default is roughly 50% of RAM).
+**Applied on this box 2026-10-06** (replacing an 80GiB setting from
+2026-09-19). Two separate settings decide how much memory the GPU gets,
+and both matter:
+
+**a. BIOS: shrink the VRAM carve-out to 512MB.** The BIOS "UMA Frame
+Buffer Size" setting (HP: F10 at boot) permanently reserves RAM as
+"VRAM" before Linux boots. This box shipped with **32GB** reserved, so
+Linux saw only ~92GiB of its 128GB — which is why this repo originally
+described it as a 96GB machine. llama.cpp allocates from GTT, not that
+carve-out, so it was mostly wasted. Set it to the 512MB minimum. Check
+with `cat /sys/class/drm/card1/device/mem_info_vram_total` (should read
+536870912) and `grep MemTotal /proc/meminfo` (~123GiB). `probe` warns if
+the carve-out is over 1GB.
+
+**b. Kernel: raise the GTT limit.** The GPU claims system RAM
+dynamically via GTT; the driver's unconfigured default is roughly 50%
+of RAM.
 
 ```bash
 sudoedit /etc/default/grub
 # Add to GRUB_CMDLINE_LINUX_DEFAULT (keep existing params):
-#   amdgpu.gttsize=81920 ttm.pages_limit=20971520
+#   amdgpu.gttsize=118784 ttm.pages_limit=30408704
 sudo update-grub
 sudo reboot
 ```
 
-This reserves ~80GiB of your ~91GiB actual RAM for GPU/GTT use, leaving
-~11GiB for the OS and host-side staging buffers. `amdgpu.gttsize` is in
-MiB; `ttm.pages_limit` is `GiB_reserved × 262144` (4KiB pages). Recompute
-both together if you change the reservation. `./serve-laguna.sh probe`
-checks whether this has been applied.
+This lets the GPU use up to ~116GiB of the ~123GiB Linux sees, leaving
+~7GiB minimum for the OS even at full GPU load (more in practice — the
+limit is a cap, not a reservation). `amdgpu.gttsize` is in MiB and is
+deprecated in favour of `ttm.pages_limit`, but `probe` still looks for
+it; `ttm.pages_limit` is `GiB × 262144` (4KiB pages). Recompute both
+together if you change it. Some 128GB Strix Halo guides use 124GiB
+(`126976` / `32505856`); 116GiB was chosen here to keep more OS
+headroom. The order of a and b doesn't matter — the GTT value is a
+ceiling, so setting it higher than current RAM is harmless at boot.
 
 This is the real, working memory-tuning lever on this hardware class —
 by contrast, direct research into GPU clock/power overclocking on
@@ -286,7 +327,7 @@ proactively. Reporting the *exact* real `CTX_SIZE` isn't enough either —
 confirmed directly on this repo's earlier deployment: `qwen-code`'s own
 token counts are estimates, and a single large step can jump past its
 compaction trigger before compaction runs. `CLIENT_CTX_SIZE` is
-deliberately lower than `CTX_SIZE` (currently 122880 vs. 163840) — the gap
+deliberately lower than `CTX_SIZE` (currently 196608 vs. 262144) — the gap
 is the safety margin.
 
 **Even that margin isn't fully reliable on its own** — confirmed directly:
