@@ -59,7 +59,12 @@ SPEC_TYPE=""
 SERVED_MODEL_NAME="laguna-s-2.1"
 
 # --- Server ---
-HOST="0.0.0.0"
+# HOST: 127.0.0.1 (loopback only) since 2026-10-06 — users reach the model
+# through the LiteLLM gateway on port 4000 (./gateway.sh, README "Multi-user
+# gateway"), which holds each user's own key. Set 0.0.0.0 only if you want
+# clients to bypass the gateway and hit llama-server directly with the
+# single shared key in .secrets/api_key.
+HOST="127.0.0.1"
 PORT="8000"
 
 # SERVER_HOST: the address a CLIENT uses to reach this server — different
@@ -80,11 +85,17 @@ SERVER_HOST="127.0.0.1"
 # generated at ~4 tok/s. Retest the same way before raising this. `serve`
 # warns (does not block) above 262144.
 #
-# CLIENT_CTX_SIZE/QWEN_SESSION_TOKEN_LIMIT below are scaled from CTX_SIZE
+# Multi-user (2026-10-06): CTX_SIZE is the TOTAL across PARALLEL slots —
+# llama-server splits it evenly, so 524288 with PARALLEL=2 gives each of
+# two simultaneous users the verified 262144. 524288 total loads with
+# 21.8GiB GTT and ~24GiB system RAM free. Set CTX_SIZE=262144 with
+# PARALLEL=1 for one user at full context.
+#
+# CLIENT_CTX_SIZE/QWEN_SESSION_TOKEN_LIMIT below are scaled from the per-slot size
 # proportionally (same ratios as the 131072-era config), preserving
 # layered-defense margins (soft compaction trigger, then a hard backstop,
 # both comfortably below the real server limit).
-CTX_SIZE="262144"
+CTX_SIZE="524288"
 
 # CLIENT_CTX_SIZE: what we tell the qwen-code CLI harness via
 # generationConfig.contextWindowSize — deliberately LOWER than CTX_SIZE,
@@ -153,9 +164,14 @@ BATCH_SIZE="2048"
 
 # PARALLEL: mitigates lemonade-sdk#3160 (progressive generation corruption
 # under concurrent/sustained load on ROCm-nightly gfx1151, recovers only on
-# full reload). Single-slot serving is the safe default. If you raise this,
-# strongly consider `./serve-laguna.sh install-watchdog`.
-PARALLEL="1"
+# full reload). PARALLEL=2 since 2026-10-06, for the multi-user gateway,
+# after a 20-round soak with 2 simultaneous requests every round (math,
+# 30K-token needle, long essay): 37 correct, 3 hit the test's own token
+# cap while still reasoning, 0 wrong, 0 degenerate output. Measured: ~20
+# tok/s per user with 2 generating at once (vs ~26 alone), ~37 tok/s total.
+# Still run `./serve-laguna.sh install-watchdog` — a 20-round soak isn't
+# weeks of real load. Set 1 for strictly single-user serving.
+PARALLEL="2"
 
 GPU_LAYERS="999"        # full offload — unified memory, no VRAM ceiling
 FLASH_ATTN="auto"       # GGML_HIP_ROCWMMA_FATTN is compiled OFF (see build

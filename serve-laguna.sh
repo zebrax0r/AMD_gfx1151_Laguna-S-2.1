@@ -137,6 +137,11 @@ load_env() {
   UBATCH_SIZE="${UBATCH_SIZE:-2048}"
   BATCH_SIZE="${BATCH_SIZE:-2048}"
   PARALLEL="${PARALLEL:-1}"
+  # llama-server splits CTX_SIZE evenly across PARALLEL slots (kv_unified
+  # off), so each concurrent user/session gets SLOT_CTX, not CTX_SIZE.
+  # Everything client-side (CLIENT_CTX_SIZE, QWEN_SESSION_TOKEN_LIMIT) has
+  # to fit inside SLOT_CTX.
+  SLOT_CTX=$(( CTX_SIZE / PARALLEL ))
   GPU_LAYERS="${GPU_LAYERS:-999}"
   FLASH_ATTN="${FLASH_ATTN:-auto}"
   # Speculative decoding: no working path currently. This model has no
@@ -504,7 +509,7 @@ cmd_serve() {
   mkdir -p "$LOG_DIR"
 
   [[ "$PARALLEL" -le 1 ]] || warn "PARALLEL=$PARALLEL (>1). This raises exposure to lemonade-sdk#3160 (progressive corruption under concurrent load). Consider 'install-watchdog'."
-  [[ "$CTX_SIZE" -le 262144 ]] || warn "CTX_SIZE=$CTX_SIZE (>262144). Verified correct at 262144 on this exact build/quant as of 2026-10-06 (128GB box, 116GiB GTT): 81.9GiB GTT used at load, exact needle retrieval at 247K tokens. 524288 loads with ~21GiB GTT free and 786432 with ~8GiB, but neither has had a correctness test, and system RAM gets tight above 512K; 1048576 OOMs during KV-cache allocation. Prefill at 247K already took ~50 min and generation at that depth ran ~4 tok/s, so a bigger window is rarely useful in practice."
+  [[ "$SLOT_CTX" -le 262144 ]] || warn "Per-slot context $SLOT_CTX (CTX_SIZE $CTX_SIZE / PARALLEL $PARALLEL) is above 262144. Verified correct at 262144 per slot on this exact build/quant as of 2026-10-06 (128GB box, 116GiB GTT): exact needle retrieval at 247K tokens. Single-slot 524288 loads with ~21GiB GTT free and 786432 with ~8GiB, but neither has had a correctness test; 1048576 OOMs. Prefill at 247K already took ~50 min and generation at that depth ran ~4 tok/s, so a bigger window is rarely useful in practice."
 
   _build_server_args "$MODEL_FILE"
 
@@ -522,7 +527,7 @@ cmd_serve() {
  ${SERVED_MODEL_NAME} is up.
    Base URL:    ${display_url}/v1
    Model alias: ${SERVED_MODEL_NAME}
-   Ctx size:    ${CTX_SIZE} (qwen-code told: ${CLIENT_CTX_SIZE})   Ubatch: ${UBATCH_SIZE}   Parallel: ${PARALLEL}
+   Ctx size:    ${CTX_SIZE} total = ${PARALLEL} x ${SLOT_CTX} per user (qwen-code told: ${CLIENT_CTX_SIZE})   Ubatch: ${UBATCH_SIZE}
    Speculative: ${SPEC_TYPE:-off}$( [[ -n "$SPEC_TYPE" ]] && echo " (draft-n-max ${SPEC_DRAFT_N_MAX})" )
    Real measured throughput on this box: ~26 tok/s sustained, no
    speculative decoding (DFlash hits a bug in Poolside's fork — see
@@ -594,6 +599,13 @@ cmd_install_watchdog() {
   mkdir -p "$HOME/.config/systemd/user"
   local unit_dir="$HOME/.config/systemd/user"
   local script_path; script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+  # If llama-server is managed by systemd (./gateway.sh install-services),
+  # restart it through systemd so the unit's state stays truthful;
+  # otherwise fall back to this script's own restart.
+  local restart_cmd="${script_path} selftest || ${script_path} restart"
+  if [[ -f "$HOME/.config/systemd/user/llm-server.service" ]]; then
+    restart_cmd="${script_path} selftest || systemctl --user restart llm-server.service"
+  fi
 
   cat > "$unit_dir/laguna-watchdog.service" <<EOF
 [Unit]
@@ -602,7 +614,13 @@ Description=Laguna S 2.1 selftest-gated watchdog (restarts only on failed selfte
 [Service]
 Type=oneshot
 WorkingDirectory=${SCRIPT_DIR}
-ExecStart=/bin/bash -c '${script_path} selftest || ${script_path} restart'
+Environment=ENV_FILE=${ENV_FILE}
+ExecStart=/bin/bash -c '${restart_cmd}'
+# Without this, systemd kills everything left in a oneshot unit's cgroup
+# when it exits — including a llama-server that 'restart' just launched
+# (setsid doesn't leave the cgroup). Only matters for the non-systemd
+# fallback restart below.
+KillMode=process
 EOF
 
   cat > "$unit_dir/laguna-watchdog.timer" <<EOF
@@ -643,7 +661,15 @@ cmd_wire_qwen_code() {
   fi
   local env_path="$qwen_dir/.env"
   local settings_path="$qwen_dir/settings.json"
-  local base_url="http://${SERVER_HOST}:${PORT}/v1"
+  # CLIENT_PORT / CLIENT_API_KEY / CLIENT_MODEL_NAME: set these to go
+  # through the multi-user gateway (port 4000, a per-user key from
+  # `./gateway.sh add-user`, model "local-coder") instead of straight to
+  # llama-server. Default to the direct-connection values.
+  local client_port="${CLIENT_PORT:-$PORT}"
+  local client_key="${CLIENT_API_KEY:-${API_KEY:-}}"
+  local client_model="${CLIENT_MODEL_NAME:-$SERVED_MODEL_NAME}"
+  [[ -n "$client_key" ]] || die "No API key: set CLIENT_API_KEY (a gateway key from './gateway.sh add-user'), or run 'init' on the server machine."
+  local base_url="http://${SERVER_HOST}:${client_port}/v1"
 
   mkdir -p "$qwen_dir"
   if [[ -f "$env_path" ]]; then
@@ -652,8 +678,8 @@ cmd_wire_qwen_code() {
   fi
   cat > "$env_path" <<EOF
 OPENAI_BASE_URL=${base_url}
-OPENAI_API_KEY=${API_KEY}
-OPENAI_MODEL=${SERVED_MODEL_NAME}
+OPENAI_API_KEY=${client_key}
+OPENAI_MODEL=${client_model}
 EOF
   chmod 600 "$env_path"
   log "Wrote $env_path"
@@ -679,9 +705,9 @@ EOF
     existing="$(cat "$settings_path")"
   fi
 
-  [[ "$CLIENT_CTX_SIZE" -lt "$CTX_SIZE" ]] || warn "CLIENT_CTX_SIZE ($CLIENT_CTX_SIZE) is not lower than CTX_SIZE ($CTX_SIZE) — this removes qwen-code's safety margin and it will likely overshoot into a hard 400 again."
+  [[ "$CLIENT_CTX_SIZE" -lt "$SLOT_CTX" ]] || warn "CLIENT_CTX_SIZE ($CLIENT_CTX_SIZE) is not lower than the per-slot context ($SLOT_CTX = CTX_SIZE $CTX_SIZE / PARALLEL $PARALLEL) — this removes qwen-code's safety margin and it will likely overshoot into a hard 400 again."
   [[ "$QWEN_SESSION_TOKEN_LIMIT" -gt "$CLIENT_CTX_SIZE" ]] || warn "QWEN_SESSION_TOKEN_LIMIT ($QWEN_SESSION_TOKEN_LIMIT) is not higher than CLIENT_CTX_SIZE ($CLIENT_CTX_SIZE) — the hard session-token block will fire before qwen-code's own proactive compaction gets a chance to run, so sessions will hit a wall requiring manual /compress or /clear instead of compacting automatically. Confirmed by hand — see README."
-  [[ "$QWEN_SESSION_TOKEN_LIMIT" -lt "$CTX_SIZE" ]] || warn "QWEN_SESSION_TOKEN_LIMIT ($QWEN_SESSION_TOKEN_LIMIT) is not lower than CTX_SIZE ($CTX_SIZE) — it won't catch a runaway turn before the server's real hard limit does."
+  [[ "$QWEN_SESSION_TOKEN_LIMIT" -lt "$SLOT_CTX" ]] || warn "QWEN_SESSION_TOKEN_LIMIT ($QWEN_SESSION_TOKEN_LIMIT) is not lower than the per-slot context ($SLOT_CTX) — it won't catch a runaway turn before the server's real hard limit does."
 
   # generationConfig.contextWindowSize tells qwen-code our ceiling.
   # Deliberately CLIENT_CTX_SIZE (lower than the real CTX_SIZE), not
@@ -699,11 +725,11 @@ EOF
   updated="$(jq \
     --arg base_url "$base_url" \
     --arg env_key "$env_key" \
-    --arg api_key "$API_KEY" \
+    --arg api_key "$client_key" \
     --arg provider_id "$provider_id" \
     --arg legacy_provider_id "$legacy_provider_id" \
     --arg provider_name "Laguna S 2.1 (gfx1151 llama.cpp/HIP)" \
-    --arg model_name "$SERVED_MODEL_NAME" \
+    --arg model_name "$client_model" \
     --argjson ctx_size "$CLIENT_CTX_SIZE" \
     --argjson tool_output_threshold "$QWEN_TOOL_OUTPUT_THRESHOLD" \
     --argjson tool_output_lines "$QWEN_TOOL_OUTPUT_LINES" \

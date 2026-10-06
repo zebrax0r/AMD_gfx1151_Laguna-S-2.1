@@ -63,7 +63,7 @@ periodically as fixes land upstream.
 | Poolside `llama.cpp` fork (branch `laguna`), DFlash speculative decoding | Reproducibly hangs during draft-model memory measurement — `"dflash requires ctx_other to be set"` followed by a hang, not a clean failure. Tested with and without `-fa`, same result. A real bug in that fork's draft-model memory-measurement path, not a flag/config issue on our end (confirmed by reading the fork's own source) | Not adopted. `SPEC_TYPE=""` — no speculative decoding currently. The ~26 tok/s baseline (no spec decoding) is already a strong result, so this isn't a blocker — see "Expected performance" |
 | [llama.cpp#28211](https://github.com/ggml-org/llama.cpp/issues/28211) | Upstream report: HIP/gfx1151 can give silently wrong logits on prompts longer than `n_ubatch` (no crash, just bad output) | Verified NOT reproduced on this exact model/build at `UBATCH_SIZE=2048` up to 4088 tokens tested (needle-in-haystack, exact retrieval). If you push well past that, re-verify with the same kind of test before trusting the output |
 | [llama.cpp#24437](https://github.com/ggml-org/llama.cpp/issues/24437) | `GGML_HIP_ROCWMMA_FATTN=ON` causes up to -41% prefill throughput on gfx1151 at 8K+ context, worsening with context length | Build compiles this flag **OFF** — a deliberate divergence from some "known-good Strix Halo" community recipes that set it ON |
-| [lemonade-sdk#3160](https://github.com/lemonade-sdk/lemonade/issues/3160) | Progressive generation corruption under sustained/concurrent load on ROCm-nightly gfx1151, recovers only on full reload | `PARALLEL=1` (single-slot serving) by default; use `restart` if output degrades, or `install-watchdog` for automated selftest-gated restarts |
+| [lemonade-sdk#3160](https://github.com/lemonade-sdk/lemonade/issues/3160) | Progressive generation corruption under sustained/concurrent load on ROCm-nightly gfx1151, recovers only on full reload | `PARALLEL=2` since 2026-10-06 for the multi-user gateway, after a 20-round 2-at-a-time soak showed no corruption (was `PARALLEL=1`); `install-watchdog` for automated selftest-gated restarts, `restart` if output degrades, `PARALLEL=1` to go back to single-slot |
 
 ## Expected performance
 
@@ -380,6 +380,95 @@ If you change `CTX_SIZE`, `CLIENT_CTX_SIZE`, `QWEN_TOOL_OUTPUT_THRESHOLD`,
 `QWEN_TOOL_OUTPUT_LINES`, or `QWEN_SESSION_TOKEN_LIMIT`, rerun
 `wire-qwen-code` (on every machine running `qwen-code` against this
 server, laptops included) so the client's config stays in sync.
+
+## Multi-user gateway (LiteLLM)
+
+Added 2026-10-06. Each person gets their own API key; you can see how
+many tokens each one used, revoke anyone instantly, and add rate limits
+or budgets later — without anyone sharing the single llama-server key.
+
+```
+ users (own key) ──> LiteLLM :4000 ──(internal key)──> llama-server 127.0.0.1:8000
+                       └─ Postgres (keys + per-request token counts)
+```
+
+- **Network:** port 4000 is opened (ufw) to the LAN (`10.49.56.0/23`) and
+  the Cisco VPN pool (`172.18.0.0/16`) only. llama-server is bound to
+  `127.0.0.1` (`HOST` in `laguna.env`), so nothing reaches it except the
+  gateway. Plain HTTP: keys cross the network unencrypted, which is
+  acceptable inside the VPN but put TLS (e.g. Caddy) in front before
+  exposing it anywhere less trusted.
+- **Model name:** users always ask for `local-coder`. llama-server serves
+  one model at a time and ignores the requested name, so switching
+  Laguna ⇄ Flash-Next changes nothing for users.
+- **Concurrency:** `PARALLEL=2`, `CTX_SIZE=524288` → two users at once,
+  262,144 tokens each. Measured ~20 tok/s per user with both generating
+  (~26 alone), ~37 tok/s total; a 20-round 2-at-a-time soak produced no
+  wrong or garbled output (see `laguna-env.example`). Each key defaults to
+  one request at a time, so one person can't take both slots. A third
+  simultaneous request queues until a slot frees up — and a long prefill
+  can hold a slot for many minutes.
+- **Privacy:** LiteLLM logs token counts per request, not prompts or
+  responses (`store_prompts_in_spend_logs: false`, verified).
+- **Secrets:** `.secrets/gateway.env` (gitignored, mode 600) holds the
+  admin key (`LITELLM_MASTER_KEY` — never hand it out), the Postgres
+  password and the salt key. This repo is public; never commit it.
+
+### Setup (once)
+
+```bash
+./gateway.sh init                      # LiteLLM venv + Prisma client + secrets
+sudo ./gateway/setup-root.sh           # Postgres, ufw rules, systemd linger
+./serve-laguna.sh serve                # llama-server (now loopback-only, 2 slots)
+./gateway.sh serve                     # LiteLLM on :4000
+./gateway.sh install-services          # start both at boot (systemd --user)
+./serve-laguna.sh install-watchdog     # selftest every 2h, restart only on failure
+```
+
+`setup-root.sh` takes `LAN_SUBNET=` / `VPN_SUBNET=` overrides if your
+networks differ.
+
+### Day to day
+
+```bash
+./gateway.sh add-user alice                    # prints base URL + key + model, once
+./gateway.sh add-user bob --tpm 100000 --rpm 30 --budget 5
+./gateway.sh list-users                        # names, limits, key hints
+./gateway.sh usage 7                           # tokens per user, last 7 days
+./gateway.sh revoke-user alice                 # immediate 401 for that key
+./gateway.sh status
+```
+
+Budgets: costs are set to 0 in `gateway/litellm-config.yaml`, so
+`--budget` does nothing until you give tokens a nominal price there (e.g.
+`0.000001` = "$1" per million tokens), after which `--budget 5` means
+roughly 5M tokens. Usage lags ~1 minute (LiteLLM writes logs in batches).
+
+Switching the served model: `systemctl --user stop llm-gateway llm-server`,
+`./gateway.sh install-services flashnext.env`, then
+`systemctl --user start llm-gateway`. Flash-Next is still configured for
+one slot (`PARALLEL=1` in `flashnext.env`) — two slots haven't been tested
+on it, and system RAM is tighter.
+
+### What a user needs
+
+Give them the three lines `add-user` prints: base URL
+(`http://10.49.56.223:4000/v1`), their key, and model `local-coder`. Any
+OpenAI-compatible client works. For `qwen-code`, from a clone of this
+repo on their machine:
+
+```bash
+SERVER_HOST=10.49.56.223 CLIENT_PORT=4000 CLIENT_API_KEY=sk-... \
+  CLIENT_MODEL_NAME=local-coder ./serve-laguna.sh wire-qwen-code
+```
+
+Allow generous output limits: Laguna sometimes reasons at length before
+answering (its reasoning arrives in `reasoning_content`), so a client
+capped at a few hundred tokens can get an empty answer with
+`finish_reason: length`. `wire-qwen-code` sets 10,000.
+
+You (on the server box) should use a key from `add-user` too, rather than
+the direct llama-server key, so your own usage shows up in `usage`.
 
 ## Client-only setup (a laptop or other machine that doesn't run the server)
 

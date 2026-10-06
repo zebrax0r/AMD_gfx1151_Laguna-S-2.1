@@ -6,3 +6,4 @@ logs/
 build/
 .venv-hf/
 *.gguf
+.venv-litellm/
